@@ -1,0 +1,91 @@
+version: "3.9"
+
+services:
+  # ── PostgreSQL ────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: neuralops
+      POSTGRES_PASSWORD: neuralops
+      POSTGRES_DB: neuralops
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U neuralops -d neuralops"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── Redis ─────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ── NeuralOps API ─────────────────────────────────────────────────────────
+  neuralops-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://neuralops:neuralops@postgres:5432/neuralops
+      - REDIS_URL=redis://redis:6379
+      - NEURALOPS_ENVIRONMENT=production
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - MISTRAL_API_KEY=${MISTRAL_API_KEY}
+      - JUDGE_MODEL=${JUDGE_MODEL:-llama-3.3-70b-versatile}
+      - JUDGE_BACKEND=${JUDGE_BACKEND:-groq}
+      - DRIFT_ALERT_THRESHOLD=${DRIFT_ALERT_THRESHOLD:-6.5}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - TOXICITY_DEVICE=cpu
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    command: >
+      sh -c "alembic upgrade head && python main.py"
+
+  # ── Streamlit Dashboard ────────────────────────────────────────────────────
+  neuralops-dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    ports:
+      - "8501:8501"
+    environment:
+      - DASHBOARD_API_URL=http://neuralops-api:8000
+    depends_on:
+      - neuralops-api
+    command: streamlit run dashboard/app.py --server.port 8501 --server.address 0.0.0.0
+    restart: unless-stopped
+
+  # ── pgAdmin (dev only — use: docker-compose --profile dev up) ─────────────
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    profiles: ["dev"]
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@neuralops.local
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+
+volumes:
+  postgres_data:
+    driver: local
