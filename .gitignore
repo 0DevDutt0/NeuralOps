@@ -124,3 +124,6 @@ Info.txt
 *.temp
 *.bak
 *.orig
+
+# ── Local video build workspace (not part of the repo) ──────────────────────
+brag-output/
