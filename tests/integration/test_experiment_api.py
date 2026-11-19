@@ -157,3 +157,68 @@ async def test_run_trial(api_client: AsyncClient):
     assert "output_b" in trial
     assert trial["score_a"] >= 0
     assert trial["score_b"] >= 0
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_fixed_evaluation_excludes_failed_pairs_and_tracks_usage(api_client: AsyncClient):
+    def complete(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        message = payload["messages"][-1]["content"]
+        if "response_format" in payload:
+            if "Trial fail" in message and "Version 2.0.0" in message:
+                answer = "invalid json"
+            else:
+                score = 3 if "Version 1.0.0" in message else (9 if "Trial 3" in message else 8)
+                answer = json.dumps(dict.fromkeys(("relevance", "accuracy", "clarity", "safety"), score))
+        else:
+            answer = message
+        return httpx.Response(200, json={
+            "choices": [{"message": {"role": "assistant", "content": answer}}],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30},
+            "model": payload["model"],
+        })
+
+    respx.post("https://api.groq.com/openai/v1/chat/completions").mock(side_effect=complete)
+    prompt = await _setup_prompt_with_versions(api_client)
+    active = await api_client.post(f"/api/v1/prompts/{prompt['id']}/activate/1.0.0")
+    assert active.status_code == 200
+    experiment = await api_client.post("/api/v1/experiments/", json={
+        "name": "fixed evaluation",
+        "prompt_id": prompt["id"],
+        "version_a": "1.0.0",
+        "version_b": "2.0.0",
+        "planned_trials": 3,
+    })
+    assert experiment.status_code == 201
+    experiment_id = experiment.json()["id"]
+    path = f"/api/v1/experiments/{experiment_id}"
+    for user_input in ("Trial 1", "Trial 2", "Trial fail"):
+        trial = await api_client.post(f"{path}/trials/", json={"user_input": user_input})
+        assert trial.status_code == 201
+    assert trial.json()["score_b"] is None
+    assert trial.json()["scoring_error"]
+
+    midway = (await api_client.get(f"{path}/significance")).json()
+    assert (midway["trial_count"], midway["scored_trial_count"]) == (3, 2)
+    assert midway["p_value"] is None
+    assert midway["mean_score_b"] == 8.0
+
+    assert (await api_client.post(f"{path}/trials/", json={"user_input": "Trial 3"})).status_code == 201
+    finished = (await api_client.get(path)).json()
+    assert finished["status"] == "completed"
+    assert finished["winner"] == "B"
+    final = (await api_client.get(f"{path}/significance")).json()
+    assert final["scored_trial_count"] == 3
+    assert final["confidence_interval_low"] > 0
+    assert final["mean_difference_b_minus_a"] == pytest.approx(5.3333)
+    assert (await api_client.post(f"{path}/trials/", json={"user_input": "Extra trial"})).status_code == 409
+
+    versions = (await api_client.get(f"/api/v1/prompts/{prompt['id']}/versions/")).json()
+    assert [version["version"] for version in versions if version["is_active"]] == ["1.0.0"]
+    usage = (await api_client.get("/api/v1/experiments/usage", params={"experiment_id": experiment_id})).json()
+    assert usage["trials"] == usage["trials_with_usage"] == 4
+    assert {row["stage"] for row in usage["usage"]} == {"generation_a", "generation_b", "judge_a", "judge_b"}
+    assert sum(row["requests"] for row in usage["usage"]) == 16
+    assert sum(row["prompt_tokens"] for row in usage["usage"]) == 320
+    assert sum(row["estimated_cost_usd"] for row in usage["usage"]) > 0

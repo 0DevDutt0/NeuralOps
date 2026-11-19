@@ -2,15 +2,17 @@
 
 from datetime import datetime
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Response
 from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from neuralops.api.dependencies import get_db
 from neuralops.core.config import settings
+from neuralops.core.logging import get_logger
 
 router = APIRouter(tags=["health"])
+logger = get_logger(__name__)
 
 
 class HealthResponse(BaseModel):
@@ -48,7 +50,7 @@ async def health() -> HealthResponse:
 
 
 @router.get("/ready", response_model=ReadinessResponse, summary="Readiness check")
-async def readiness(db: AsyncSession = Depends(get_db)) -> ReadinessResponse:
+async def readiness(response: Response, db: AsyncSession = Depends(get_db)) -> ReadinessResponse:
     """Check whether the application is ready to serve traffic.
 
     Validates database connectivity.
@@ -64,7 +66,9 @@ async def readiness(db: AsyncSession = Depends(get_db)) -> ReadinessResponse:
         db_status = "ok"
         ready = True
     except Exception as exc:
-        db_status = f"error: {exc}"
+        logger.warning("Database readiness check failed", error_type=type(exc).__name__)
+        response.status_code = 503
+        db_status = "unavailable"
         ready = False
 
     return ReadinessResponse(

@@ -1,0 +1,126 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# NeuralOps — .gitignore
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+venv/
+env/
+ENV/
+.venv/
+.env.local
+
+# ── Environment / secrets — NEVER COMMIT ─────────────────────────────────────
+.env
+*.env
+!.env.example
+
+# ── Testing & coverage ───────────────────────────────────────────────────────
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+coverage.json
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+htmlcov/
+
+# ── Type checking ────────────────────────────────────────────────────────────
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# ── Linting ──────────────────────────────────────────────────────────────────
+.ruff_cache/
+
+# ── Databases ────────────────────────────────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+neuralops_dev.db
+
+# ── Alembic ──────────────────────────────────────────────────────────────────
+neuralops/migrations/alembic/versions/__pycache__/
+
+# ── ML model artifacts (HuggingFace / PyTorch / ONNX) ────────────────────────
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.onnx
+transformers_cache/
+huggingface_cache/
+.cache/huggingface/
+torch_extensions/
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+logs/
+*.log.*
+
+# ── OS artifacts ─────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ── IDE / editors ────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+*~
+.project
+.classpath
+.settings/
+
+# ── Claude Code ──────────────────────────────────────────────────────────────
+.claude/
+
+# ── Personal / project notes ─────────────────────────────────────────────────
+Info.txt
+
+# ── Docker build context (tracked file, but not its cache) ───────────────────
+.docker/
+
+# ── Jupyter Notebooks ────────────────────────────────────────────────────────
+.ipynb_checkpoints
+*.ipynb
+
+# ── Temporary files ──────────────────────────────────────────────────────────
+*.tmp
+*.temp
+*.bak
+*.orig

@@ -74,24 +74,23 @@ def test_parse_judge_response_clamps_scores():
     assert result.accuracy == 1.0
 
 
-def test_parse_judge_response_uses_composite_if_provided():
+def test_parse_judge_response_computes_composite_from_rubric():
     raw = json.dumps({
         "relevance": 5.0,
         "accuracy": 5.0,
         "clarity": 5.0,
         "safety": 5.0,
-        "composite": 9.99,  # Explicit override
+        "composite": 9.99,
         "reasoning": "Custom composite",
         "confidence": 1.0,
     })
     result = _parse_judge_response(raw, "test-model", [])
-    assert result.composite == 9.99
+    assert result.composite == 5.0
 
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_judge_returns_default_on_json_parse_error():
-    """If the judge returns non-JSON, we get default 5.0 scores without raising."""
+async def test_judge_records_json_parse_error_without_a_score():
     respx.post("https://api.groq.com/openai/v1/chat/completions").mock(
         return_value=httpx.Response(
             200,
@@ -104,8 +103,10 @@ async def test_judge_returns_default_on_json_parse_error():
     )
     judge = LLMJudge()
     score = await judge.score("some response")
-    assert score.composite == 5.0
+    assert score.composite is None
     assert score.confidence == 0.0
+    assert score.error == "Invalid judge response"
+    assert score.usage is not None and score.usage.total_tokens == 110
 
 
 def test_judge_weights_sum_to_one():

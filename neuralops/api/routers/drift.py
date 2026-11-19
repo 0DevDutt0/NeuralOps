@@ -1,10 +1,11 @@
 """Drift monitoring endpoints."""
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Query
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from neuralops.api.dependencies import get_db
+from neuralops.api.dependencies import get_db, get_judge
+from neuralops.engine.judge import LLMJudge
 from neuralops.models.drift_log import DriftLog
 from neuralops.schemas.drift import DriftLogResponse, DriftStatusResponse, DriftSummaryResponse
 from neuralops.services import drift_service
@@ -65,8 +66,8 @@ async def list_drift_logs(
 
 @router.post("/trigger", response_model=list[DriftLogResponse], summary="Trigger drift check")
 async def trigger_drift_check(
-    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
+    judge: LLMJudge = Depends(get_judge),
 ) -> list[DriftLogResponse]:
     """Manually trigger a drift check run for all active prompts.
 
@@ -74,10 +75,10 @@ async def trigger_drift_check(
     scheduler for automated periodic checks.
 
     Args:
-        background_tasks: FastAPI background task runner.
         db: Database session.
+        judge: Scorer for the active prompt versions.
 
     Returns:
         List of drift log snapshots created in this run.
     """
-    return await drift_service.run_drift_check(db)
+    return await drift_service.run_drift_check(db, judge)

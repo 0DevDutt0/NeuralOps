@@ -1,22 +1,23 @@
 """Async A/B test executor.
 
 Runs the same input through two prompt versions concurrently, scores
-both outputs with LLM-as-Judge, stores the trial, and checks for
-statistical significance to auto-promote a winner.
+both outputs with LLM-as-Judge and evaluates a fixed number of valid pairs.
 """
 
 import asyncio
-import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from statistics import mean, variance
 
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from neuralops.core.config import settings
+from neuralops.core.exceptions import ExperimentAlreadyCompletedError
 from neuralops.core.logging import get_logger
 from neuralops.engine.judge import JudgeScore, LLMJudge
-from neuralops.models.experiment import Experiment, ExperimentTrial
+from neuralops.models.experiment import Experiment, ExperimentTrial, TrialUsage
 from neuralops.services.llm_client import LLMBackend, LLMClient
 
 logger = get_logger(__name__)
@@ -47,13 +48,13 @@ class TrialResult:
     user_input: str
     output_a: str
     output_b: str
-    score_a: float
-    score_b: float
+    score_a: float | None
+    score_b: float | None
     score_details_a: JudgeScore
     score_details_b: JudgeScore
     latency_a_ms: float
     latency_b_ms: float
-    winner_this_trial: str
+    winner_this_trial: str | None
     experiment_winner: str | None = None
 
 
@@ -62,7 +63,7 @@ class SignificanceTestResult:
     """Result of the statistical significance test.
 
     Attributes:
-        p_value: p-value from Welch's t-test (None if n < 2).
+        p_value: Two-sided paired t-test p-value when estimable.
         is_significant: True if p < significance_level.
         winner: "A" | "B" | None.
         mean_a: Mean score for version A.
@@ -76,49 +77,60 @@ class SignificanceTestResult:
     mean_a: float
     mean_b: float
     n_trials: int
+    mean_difference: float | None
+    interval_low: float | None = None
+    interval_high: float | None = None
 
 
 def _run_significance_test(
     scores_a: list[float],
     scores_b: list[float],
     significance_level: float,
+    *,
+    evaluate: bool = True,
 ) -> SignificanceTestResult:
-    """Run Welch's t-test to check if the score difference is significant.
-
-    Args:
-        scores_a: All scores for version A.
-        scores_b: All scores for version B.
-        significance_level: Alpha threshold (e.g. 0.05).
-
-    Returns:
-        SignificanceTestResult with p-value and winner.
-    """
-    from scipy import stats  # type: ignore[import]
-
-    n = min(len(scores_a), len(scores_b))
-    mean_a = sum(scores_a) / len(scores_a) if scores_a else 0.0
-    mean_b = sum(scores_b) / len(scores_b) if scores_b else 0.0
-
-    if n < 2:
-        return SignificanceTestResult(
-            p_value=None, is_significant=False, winner=None,
-            mean_a=mean_a, mean_b=mean_b, n_trials=n
-        )
-
-    _, p_value = stats.ttest_ind(scores_a, scores_b, equal_var=False)
-    is_significant = float(p_value) < significance_level
-    winner = None
-    if is_significant:
-        winner = "A" if mean_a > mean_b else "B"
-
-    return SignificanceTestResult(
-        p_value=round(float(p_value), 6),
-        is_significant=is_significant,
-        winner=winner,
-        mean_a=round(mean_a, 4),
-        mean_b=round(mean_b, 4),
+    """Summarize paired scores and compute inference at the planned endpoint."""
+    differences = [b - a for a, b in zip(scores_a, scores_b, strict=True)]
+    n = len(differences)
+    result = SignificanceTestResult(
+        p_value=None,
+        is_significant=False,
+        winner=None,
+        mean_a=round(mean(scores_a), 4) if n else 0.0,
+        mean_b=round(mean(scores_b), 4) if n else 0.0,
         n_trials=n,
+        mean_difference=round(mean(differences), 4) if n else None,
     )
+    if not evaluate or n < 2 or variance(round(delta, 10) for delta in differences) == 0:
+        return result
+
+    from scipy import stats
+
+    paired = stats.ttest_rel(scores_b, scores_a)
+    interval = paired.confidence_interval(confidence_level=1 - significance_level)
+    result.p_value = float(paired.pvalue)
+    result.interval_low = float(interval.low)
+    result.interval_high = float(interval.high)
+    result.is_significant = result.p_value < significance_level
+    if result.is_significant:
+        result.winner = "B" if mean(differences) > 0 else "A"
+    return result
+
+
+async def get_paired_scores(db: AsyncSession, experiment_id: str) -> tuple[list[float], list[float]]:
+    """Read scores from trials where both arms scored successfully."""
+    rows = await db.execute(
+        select(ExperimentTrial.score_a, ExperimentTrial.score_b).where(
+            ExperimentTrial.experiment_id == experiment_id,
+            ExperimentTrial.scoring_error.is_(None),
+        )
+    )
+    scores_a, scores_b = [], []
+    for score_a, score_b in rows:
+        if score_a is not None and score_b is not None:
+            scores_a.append(score_a)
+            scores_b.append(score_b)
+    return scores_a, scores_b
 
 
 class ABRunner:
@@ -170,27 +182,11 @@ class ABRunner:
         prompt_b = content_b.replace("{input}", user_input).replace("{user_input}", user_input)
 
         # Run both LLM calls concurrently
-        t0_a = t0_b = time.monotonic()
-
-        async def call_a():
-            nonlocal t0_a
-            t0_a = time.monotonic()
-            return await self._llm.complete(
-                prompt=prompt_a,
-                system=system_a,
-                backend=LLMBackend(settings.llm_provider),
-            )
-
-        async def call_b():
-            nonlocal t0_b
-            t0_b = time.monotonic()
-            return await self._llm.complete(
-                prompt=prompt_b,
-                system=system_b,
-                backend=LLMBackend(settings.llm_provider),
-            )
-
-        resp_a, resp_b = await asyncio.gather(call_a(), call_b())
+        backend = LLMBackend(settings.llm_provider)
+        resp_a, resp_b = await asyncio.gather(
+            self._llm.complete(prompt=prompt_a, system=system_a, backend=backend),
+            self._llm.complete(prompt=prompt_b, system=system_b, backend=backend),
+        )
 
         latency_a = resp_a.latency_ms
         latency_b = resp_b.latency_ms
@@ -203,9 +199,24 @@ class ABRunner:
             criteria=experiment.judge_criteria or None,
         )
 
-        winner_this = "A" if score_a.composite > score_b.composite else (
-            "B" if score_b.composite > score_a.composite else "tie"
+        winner_this = None
+        valid_pair = score_a.composite is not None and score_b.composite is not None
+        if score_a.composite is not None and score_b.composite is not None:
+            winner_this = "A" if score_a.composite > score_b.composite else (
+                "B" if score_b.composite > score_a.composite else "tie"
+            )
+
+        # Serialize writes for this experiment after the provider calls finish.
+        updated = await db.execute(
+            update(Experiment)
+            .where(Experiment.id == experiment.id, Experiment.status != "completed")
+            .values(trial_count=Experiment.trial_count + 1)
+            .returning(Experiment.id)
+            .execution_options(synchronize_session=False)
         )
+        if updated.scalar_one_or_none() is None:
+            raise ExperimentAlreadyCompletedError("The experiment no longer accepts trials")
+        await db.refresh(experiment)
 
         # Store trial
         trial = ExperimentTrial(
@@ -216,6 +227,7 @@ class ABRunner:
             output_b=resp_b.content,
             score_a=score_a.composite,
             score_b=score_b.composite,
+            scoring_error=None if valid_pair else "The judge could not score both outputs",
             judge_reasoning={
                 "a": {
                     "relevance": score_a.relevance,
@@ -224,6 +236,8 @@ class ABRunner:
                     "safety": score_a.safety,
                     "reasoning": score_a.reasoning,
                     "confidence": score_a.confidence,
+                    "model": score_a.model,
+                    "error": score_a.error,
                 },
                 "b": {
                     "relevance": score_b.relevance,
@@ -232,43 +246,50 @@ class ABRunner:
                     "safety": score_b.safety,
                     "reasoning": score_b.reasoning,
                     "confidence": score_b.confidence,
+                    "model": score_b.model,
+                    "error": score_b.error,
                 },
             },
             latency_a_ms=latency_a,
             latency_b_ms=latency_b,
         )
         db.add(trial)
+        await db.flush()
 
-        # Update experiment statistics
-        n = experiment.trial_count + 1
-        # Incremental mean update
-        new_mean_a = (experiment.mean_score_a * experiment.trial_count + score_a.composite) / n
-        new_mean_b = (experiment.mean_score_b * experiment.trial_count + score_b.composite) / n
-        experiment.trial_count = n
-        experiment.mean_score_a = round(new_mean_a, 4)
-        experiment.mean_score_b = round(new_mean_b, 4)
+        for stage, response in (
+            ("generation_a", resp_a), ("generation_b", resp_b),
+            ("judge_a", score_a.usage), ("judge_b", score_b.usage),
+        ):
+            if response is not None:
+                db.add(TrialUsage(
+                    trial_id=trial.id,
+                    stage=stage,
+                    model=response.model,
+                    provider=response.backend.value,
+                    prompt_tokens=response.prompt_tokens,
+                    completion_tokens=response.completion_tokens,
+                    estimated_cost_usd=response.cost_usd,
+                ))
 
-        # Check significance (requires fetching all trial scores for a proper t-test)
         experiment_winner = None
-        if n >= 30:
-            from sqlalchemy import select
-
-            rows = await db.execute(
-                select(ExperimentTrial.score_a, ExperimentTrial.score_b).where(
-                    ExperimentTrial.experiment_id == experiment.id
+        if score_a.composite is not None and score_b.composite is not None:
+            experiment.scored_trial_count += 1
+            n = experiment.scored_trial_count
+            experiment.mean_score_a += (score_a.composite - experiment.mean_score_a) / n
+            experiment.mean_score_b += (score_b.composite - experiment.mean_score_b) / n
+            if experiment.planned_trials == n:
+                scores_a, scores_b = await get_paired_scores(db, experiment.id)
+                sig = _run_significance_test(
+                    scores_a, scores_b, experiment.significance_level or settings.experiment_significance_level
                 )
-            )
-            all_scores = rows.all()
-            all_a = [r[0] for r in all_scores]
-            all_b = [r[1] for r in all_scores]
-            sig = _run_significance_test(all_a, all_b, settings.experiment_significance_level)
-            if sig.is_significant and sig.winner:
+                experiment.mean_score_a = sig.mean_a
+                experiment.mean_score_b = sig.mean_b
                 experiment.winner = sig.winner
                 experiment.status = "completed"
                 experiment.completed_at = datetime.utcnow()
                 experiment_winner = sig.winner
                 logger.info(
-                    "Experiment winner declared",
+                    "Fixed evaluation completed",
                     experiment_id=experiment.id,
                     winner=sig.winner,
                     p_value=sig.p_value,

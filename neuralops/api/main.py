@@ -45,7 +45,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         port=settings.neuralops_port,
     )
 
-    # Start APScheduler for drift detection
+    app.state.scheduler = None
+    if settings.neuralops_environment != "demo":
+        app.state.scheduler = _start_drift_scheduler()
+
+    yield
+
+    if app.state.scheduler is not None:
+        app.state.scheduler.shutdown(wait=False)
+    await engine.dispose()
+    logger.info("NeuralOps shutdown complete")
+
+
+def _start_drift_scheduler():
+    """Start periodic quality checks for the configured provider."""
     try:
         from apscheduler.schedulers.asyncio import AsyncIOScheduler  # type: ignore[import]
 
@@ -66,22 +79,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             replace_existing=True,
         )
         scheduler.start()
-        app.state.scheduler = scheduler
         logger.info(
             "Drift scheduler started",
             interval_minutes=settings.drift_check_interval_minutes,
         )
+        return scheduler
     except Exception as exc:
         logger.warning("Scheduler failed to start", error=str(exc))
-        app.state.scheduler = None
-
-    yield
-
-    # Shutdown
-    if hasattr(app.state, "scheduler") and app.state.scheduler:
-        app.state.scheduler.shutdown(wait=False)
-    await engine.dispose()
-    logger.info("NeuralOps shutdown complete")
+        return None
 
 
 def create_app() -> FastAPI:
@@ -92,7 +97,7 @@ def create_app() -> FastAPI:
     """
     app = FastAPI(
         title="NeuralOps API",
-        description="Production-grade LLMOps platform — prompts versioned, tested, monitored.",
+        description="Version prompts, compare paired evaluations, and review release results.",
         version="0.1.0",
         lifespan=lifespan,
         docs_url="/docs",
@@ -102,7 +107,7 @@ def create_app() -> FastAPI:
 
     # Rate limiting
     app.state.limiter = limiter
-    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # type: ignore[arg-type]
 
     # Middleware (applied in reverse order — last added = outermost)
     configure_cors(app)

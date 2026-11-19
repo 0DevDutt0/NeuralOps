@@ -8,8 +8,7 @@ Tables:
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text
-from sqlalchemy.dialects.sqlite import JSON
+from sqlalchemy import JSON, DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from neuralops.core.database import Base
@@ -49,7 +48,10 @@ class Experiment(Base):
     judge_criteria: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     status: Mapped[str] = mapped_column(String(20), default="running", nullable=False)
     winner: Mapped[str | None] = mapped_column(String(1), nullable=True)
+    planned_trials: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    significance_level: Mapped[float | None] = mapped_column(Float, nullable=True)
     trial_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    scored_trial_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     mean_score_a: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     mean_score_b: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
@@ -92,11 +94,28 @@ class ExperimentTrial(Base):
     user_input: Mapped[str] = mapped_column(Text, nullable=False)
     output_a: Mapped[str] = mapped_column(Text, nullable=False)
     output_b: Mapped[str] = mapped_column(Text, nullable=False)
-    score_a: Mapped[float] = mapped_column(Float, nullable=False)
-    score_b: Mapped[float] = mapped_column(Float, nullable=False)
+    score_a: Mapped[float | None] = mapped_column(Float, nullable=True)
+    score_b: Mapped[float | None] = mapped_column(Float, nullable=True)
+    scoring_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     judge_reasoning: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     latency_a_ms: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     latency_b_ms: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
     experiment: Mapped["Experiment"] = relationship("Experiment", back_populates="trials")
+
+
+class TrialUsage(Base):
+    """Usage reported or estimated for one completed generation or judge call."""
+
+    __tablename__ = "trial_usage"
+
+    trial_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("experiment_trials.id", ondelete="CASCADE"), primary_key=True
+    )
+    stage: Mapped[str] = mapped_column(String(12), primary_key=True)
+    model: Mapped[str] = mapped_column(String(255), nullable=False)
+    provider: Mapped[str] = mapped_column(String(30), nullable=False)
+    prompt_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
+    completion_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
+    estimated_cost_usd: Mapped[float] = mapped_column(Float, nullable=False)

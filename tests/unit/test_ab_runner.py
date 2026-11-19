@@ -54,24 +54,26 @@ def test_significance_insufficient_data():
     assert result.winner is None
 
 
-def test_significance_clearly_different_groups():
-    # Group A: consistently low scores
-    scores_a = [4.0, 4.1, 3.9, 4.2, 4.0] * 8  # 40 samples
-    # Group B: consistently high scores
-    scores_b = [8.0, 8.1, 7.9, 8.2, 8.0] * 8  # 40 samples
+def test_significance_uses_paired_differences():
+    # Large per-input variation cancels out in the paired differences.
+    scores_a = [1.0, 3.0, 5.0, 7.0, 9.0]
+    scores_b = [1.4, 3.5, 5.6, 7.5, 9.5]
     result = _run_significance_test(scores_a, scores_b, 0.05)
     assert result.is_significant is True
     assert result.winner == "B"
     assert result.p_value is not None
     assert result.p_value < 0.05
+    assert result.mean_difference == 0.5
+    assert result.interval_low is not None and result.interval_low > 0
+    assert result.interval_high is not None and result.interval_high > 0.5
 
 
-def test_significance_similar_groups():
-    # Groups with the same distribution — should not be significant
+def test_significance_handles_zero_variance_without_nonfinite_values():
     scores = [7.0, 7.1, 6.9, 7.0, 7.1] * 8
     result = _run_significance_test(scores, scores, 0.05)
-    # With identical data, t-test returns NaN p-value — handle gracefully
-    assert result.winner is None or result.is_significant is False
+    assert result.winner is None
+    assert result.p_value is None
+    assert result.mean_difference == 0
 
 
 def test_significance_mean_calculation():

@@ -6,7 +6,7 @@
     Experiments    — A/B test management and live results
     Model Registry — Register and monitor LLM models
     Drift Monitor  — Quality drift timeline and alert history
-    Cost Tracker   — Token usage and cost breakdown charts
+    Cost Tracker   — Recorded token usage and estimated spend
 
 Run with: streamlit run dashboard/app.py
 """
@@ -100,6 +100,17 @@ def api_post(path: str, data: dict) -> dict | None:
 # PAGE 1 — Overview
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def show_trial(trial: dict) -> None:
+    st.caption(trial["user_input"])
+    if trial.get("scoring_error"):
+        st.warning(trial["scoring_error"])
+    for arm, column in zip(("a", "b"), st.columns(2), strict=True):
+        score = trial[f"score_{arm}"]
+        label = f"{score:.2f} / 10" if score is not None else "Unscored"
+        column.metric(f"Version {arm.upper()}", label)
+        column.write(trial[f"output_{arm}"])
+
+
 if page == "Overview":
     st.title("🧠 NeuralOps — Overview")
 
@@ -192,9 +203,18 @@ elif page == "Prompt Manager":
                         ])
                         st.dataframe(df, use_container_width=True)
 
-                        # Diff viewer
-                        st.subheader("Version Diff")
                         version_tags = [v["version"] for v in versions]
+                        active = next((v["version"] for v in versions if v["is_active"]), None)
+                        st.subheader("Release")
+                        st.caption(f"Active version · {active or 'None'}")
+                        target = st.selectbox("Release version", version_tags)
+                        for action, column in zip(("activate", "rollback"), st.columns(2), strict=True):
+                            if column.button(action.capitalize(), disabled=target == active):
+                                if api_post(f"/api/v1/prompts/{prompt_id}/{action}/{target}", {}):
+                                    st.cache_data.clear()
+                                    st.rerun()
+
+                        st.subheader("Version Diff")
                         if len(version_tags) >= 2:
                             col1, col2 = st.columns(2)
                             v1 = col1.selectbox("From", version_tags, index=0)
@@ -246,7 +266,7 @@ elif page == "Prompt Manager":
 elif page == "Experiments":
     st.title("🧪 A/B Experiments")
 
-    tab1, tab2 = st.tabs(["Active Experiments", "Create Experiment"])
+    tab1, tab2 = st.tabs(["Results", "Create Experiment"])
 
     with tab1:
         experiments = api_get("/api/v1/experiments/") or []
@@ -263,33 +283,52 @@ elif page == "Experiments":
                     col3.metric("Mean Score A", round(exp["mean_score_a"], 2))
                     col4.metric("Mean Score B", round(exp["mean_score_b"], 2))
 
-                    if exp.get("winner"):
-                        st.success(f"🏆 Winner: Version {exp['winner']}")
+                    planned = exp["planned_trials"]
+                    scored = exp["scored_trial_count"]
+                    st.caption(f"{scored}{f' / {planned}' if planned else ''} valid pairs · {exp['trial_count']} attempts")
+                    if planned is None:
+                        st.info("Historical experiment. Start a fixed-size experiment for a new recommendation.")
+                    elif exp.get("winner"):
+                        st.success(f"Recommended · Version {exp['winner']}. Activate it in Prompt Manager.")
+                    elif exp["status"] == "completed":
+                        st.info("Evaluation complete. No winner was established.")
 
-                    st.caption(f"Trials: {exp['trial_count']} | ID: `{exp['id']}`")
-
-                    # Significance check
-                    if st.button("Check Significance", key=f"sig_{exp['id']}"):
-                        sig = api_get(f"/api/v1/experiments/{exp['id']}/significance")
-                        if sig:
-                            cols = st.columns(3)
-                            cols[0].metric("p-value", sig.get("p_value") or "N/A")
-                            cols[1].metric("Significant?", "Yes" if sig["is_significant"] else "No")
-                            cols[2].metric("Winner", sig.get("winner") or "—")
-
-                    # Run a trial
-                    st.subheader("Run Trial")
-                    user_input = st.text_area("User Input", key=f"input_{exp['id']}")
-                    if st.button("Run", key=f"run_{exp['id']}") and user_input:
-                        with st.spinner("Running trial..."):
-                            result = api_post(
-                                f"/api/v1/experiments/{exp['id']}/trials/",
-                                {"user_input": user_input},
+                    experiment_path = f"/api/v1/experiments/{exp['id']}"
+                    if exp["status"] == "completed" and planned is not None:
+                        sig = api_get(f"{experiment_path}/significance")
+                        if sig and sig["mean_difference_b_minus_a"] is not None:
+                            delta, interval, probability = st.columns(3)
+                            delta.metric("Mean difference (B − A)", f"{sig['mean_difference_b_minus_a']:+.2f}")
+                            low = sig["confidence_interval_low"]
+                            high = sig["confidence_interval_high"]
+                            level = sig["confidence_level"] * 100
+                            interval.metric(
+                                f"{level:g}% confidence interval",
+                                f"[{low:+.2f}, {high:+.2f}]" if low is not None else "Unavailable",
                             )
-                        if result:
-                            col1, col2 = st.columns(2)
-                            col1.markdown(f"**Version A** (score: {result['score_a']:.2f})\n\n{result['output_a']}")
-                            col2.markdown(f"**Version B** (score: {result['score_b']:.2f})\n\n{result['output_b']}")
+                            p_value = sig["p_value"]
+                            probability.metric("Paired p-value", f"{p_value:.3g}" if p_value is not None else "Unavailable")
+
+                    if exp["status"] != "completed":
+                        user_input = st.text_area("Trial input", key=f"input_{exp['id']}")
+                        if st.button("Run trial", key=f"run_{exp['id']}", disabled=not user_input.strip()):
+                            with st.spinner("Running trial..."):
+                                result = api_post(f"{experiment_path}/trials/", {"user_input": user_input})
+                            if result:
+                                st.cache_data.clear()
+                                st.rerun()
+
+                    if exp["trial_count"]:
+                        detail = api_get(experiment_path)
+                        if detail and detail["recent_trials"]:
+                            trial_options = {
+                                f"{index}. {trial['user_input']}": trial
+                                for index, trial in enumerate(reversed(detail["recent_trials"]), start=1)
+                            }
+                            selected = st.selectbox(
+                                "Inspect a trial", list(trial_options), key=f"trial_{exp['id']}",
+                            )
+                            show_trial(trial_options[selected])
 
     with tab2:
         st.subheader("Create A/B Experiment")
@@ -304,6 +343,10 @@ elif page == "Experiments":
                 col1, col2 = st.columns(2)
                 version_a = col1.text_input("Version A", placeholder="1.0.0")
                 version_b = col2.text_input("Version B", placeholder="2.0.0")
+                planned_trials = st.number_input(
+                    "Planned valid pairs", min_value=2, max_value=10_000, value=30,
+                    help="Choose the sample size before running any cases.",
+                )
                 submitted = st.form_submit_button("Create Experiment")
                 if submitted and exp_name and version_a and version_b:
                     result = api_post("/api/v1/experiments/", {
@@ -311,6 +354,7 @@ elif page == "Experiments":
                         "prompt_id": prompt_options[selected_prompt],
                         "version_a": version_a,
                         "version_b": version_b,
+                        "planned_trials": int(planned_trials),
                     })
                     if result:
                         st.success(f"Experiment created: `{result['id']}`")
@@ -412,7 +456,7 @@ elif page == "Drift Monitor":
         col3.metric(
             "Drifting",
             summary["drifting_prompts"],
-            delta=None if summary["drifting_prompts"] == 0 else f"⚠️",
+            delta=None if summary["drifting_prompts"] == 0 else "⚠️",
             delta_color="inverse",
         )
         col4.metric("Alerts (24h)", summary["alerts_last_24h"])
@@ -427,15 +471,15 @@ elif page == "Drift Monitor":
     else:
         df = pd.DataFrame([
             {
-                "Prompt ID": l["prompt_id"][:8] + "...",
-                "Version": l["prompt_version"],
-                "Score": round(l["mean_composite_score"], 2),
-                "Safety": round(l["mean_safety"], 2),
-                "Alert": "🚨" if l["alert_fired"] else "✅",
-                "Samples": l["sample_count"],
-                "Date": l["created_at"][:16],
+                "Prompt ID": log["prompt_id"][:8] + "...",
+                "Version": log["prompt_version"],
+                "Score": round(log["mean_composite_score"], 2),
+                "Safety": round(log["mean_safety"], 2),
+                "Alert": "🚨" if log["alert_fired"] else "✅",
+                "Samples": log["sample_count"],
+                "Date": log["created_at"][:16],
             }
-            for l in logs
+            for log in logs
         ])
         st.dataframe(df, use_container_width=True)
 
@@ -444,11 +488,11 @@ elif page == "Drift Monitor":
         if logs:
             timeline_df = pd.DataFrame([
                 {
-                    "date": l["created_at"],
-                    "score": l["mean_composite_score"],
-                    "prompt": l["prompt_id"][:8],
+                    "date": log["created_at"],
+                    "score": log["mean_composite_score"],
+                    "prompt": log["prompt_id"][:8],
                 }
-                for l in logs
+                for log in logs
             ])
             fig = px.line(
                 timeline_df,
@@ -482,55 +526,29 @@ elif page == "Drift Monitor":
 elif page == "Cost Tracker":
     st.title("💰 Cost Tracker")
 
-    st.info(
-        "Cost tracking aggregates token usage from experiment trials. "
-        "Run some experiments to see data here."
-    )
-
     experiments = api_get("/api/v1/experiments/") or []
-    if experiments:
-        st.subheader("Experiment Score vs Cost (estimated)")
-        data = []
-        for exp in experiments:
-            if exp["trial_count"] > 0:
-                data.append({
-                    "name": exp["name"],
-                    "trials": exp["trial_count"],
-                    "mean_score_a": exp["mean_score_a"],
-                    "mean_score_b": exp["mean_score_b"],
-                    "status": exp["status"],
-                })
+    options = {"All experiments": ""}
+    options.update({f"{exp['name']} ? {exp['id'][:8]}": exp["id"] for exp in experiments})
+    selected = options[st.selectbox("Experiment", list(options))]
+    filter_query = f"?experiment_id={selected}" if selected else ""
+    report = api_get(f"/api/v1/experiments/usage{filter_query}")
 
-        if data:
-            df = pd.DataFrame(data)
-            fig = px.scatter(
-                df,
-                x="trials",
-                y="mean_score_a",
-                size="trials",
-                color="status",
-                hover_name="name",
-                title="Trials vs Score (Version A)",
-                color_discrete_sequence=px.colors.qualitative.Set2,
-            )
-            fig.update_layout(
-                paper_bgcolor="#0e1117",
-                plot_bgcolor="#0e1117",
-                font_color="white",
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-    models_data = api_get("/api/v1/models/") or []
-    if models_data:
-        st.subheader("Registered Model Cost Table")
-        df = pd.DataFrame([
-            {
-                "Model": m["name"],
-                "Provider": m["provider"],
-                "$/1M Input": m["cost_per_1k_input_tokens"] * 1000,
-                "$/1M Output": m["cost_per_1k_output_tokens"] * 1000,
-                "Active": m["is_active"],
-            }
-            for m in models_data
-        ])
-        st.dataframe(df, use_container_width=True)
+    if report:
+        st.caption(f"Usage recorded for {report['trials_with_usage']} of {report['trials']} trials.")
+        if not report["usage"]:
+            st.info("Run an experiment to record token usage and estimated cost.")
+        else:
+            rows = pd.DataFrame(report["usage"])
+            spend = rows["estimated_cost_usd"].sum()
+            tokens = rows["prompt_tokens"].sum() + rows["completion_tokens"].sum()
+            cost_column, token_column = st.columns(2)
+            cost_column.metric("Estimated cost", f"${spend:,.6f}")
+            token_column.metric("Recorded tokens", f"{tokens:,}")
+            rows["stage"] = rows["stage"].str.replace("_", " ").str.title()
+            chart = px.bar(rows, x="stage", y="estimated_cost_usd", color="model", labels={
+                "stage": "Stage", "estimated_cost_usd": "Estimated cost (USD)", "model": "Model"
+            })
+            st.plotly_chart(chart, use_container_width=True)
+            st.dataframe(rows, use_container_width=True, hide_index=True)
+            st.caption("Provider counts when available. Local estimates fill missing counts. "
+                       "Costs use configured rate estimates and exclude calls without recorded usage.")

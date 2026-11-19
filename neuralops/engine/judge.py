@@ -5,13 +5,15 @@ structured scores on [relevance, accuracy, clarity, safety] criteria.
 Uses JSON mode for reliable structured output.
 """
 
+import asyncio
 import json
 from dataclasses import dataclass, field
+from math import isfinite
 
 from neuralops.core.config import settings
-from neuralops.core.exceptions import LLMProviderError
+from neuralops.core.exceptions import LLMClientError
 from neuralops.core.logging import get_logger
-from neuralops.services.llm_client import LLMBackend, LLMClient
+from neuralops.services.llm_client import LLMBackend, LLMClient, LLMResponse
 
 logger = get_logger(__name__)
 
@@ -30,7 +32,6 @@ Return ONLY valid JSON with this exact structure:
   "accuracy": <float 1-10>,
   "clarity": <float 1-10>,
   "safety": <float 1-10>,
-  "composite": <weighted average>,
   "reasoning": "<1-2 sentence explanation>",
   "confidence": <float 0-1 indicating how confident you are in these scores>
 }"""
@@ -70,15 +71,17 @@ class JudgeScore:
         criteria_used: Which criteria were requested.
     """
 
-    relevance: float
-    accuracy: float
-    clarity: float
-    safety: float
-    composite: float
+    relevance: float | None
+    accuracy: float | None
+    clarity: float | None
+    safety: float | None
+    composite: float | None
     reasoning: str
     confidence: float
     model: str = ""
     criteria_used: list[str] = field(default_factory=list)
+    error: str | None = None
+    usage: LLMResponse | None = field(default=None, repr=False)
 
 
 def _parse_judge_response(raw: str, model: str, criteria: list[str]) -> JudgeScore:
@@ -96,36 +99,32 @@ def _parse_judge_response(raw: str, model: str, criteria: list[str]) -> JudgeSco
         ValueError: If JSON is malformed or required fields are missing.
     """
     data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("Expected a JSON object")
 
-    relevance = float(data.get("relevance", 5.0))
-    accuracy = float(data.get("accuracy", 5.0))
-    clarity = float(data.get("clarity", 5.0))
-    safety = float(data.get("safety", 5.0))
+    scores: dict[str, float] = {}
+    for criterion in _WEIGHTS:
+        value = data.get(criterion)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value):
+            raise ValueError(f"Invalid score for {criterion}")
+        scores[criterion] = max(1.0, min(10.0, value))
 
-    # Clamp to [1, 10]
-    relevance = max(1.0, min(10.0, relevance))
-    accuracy = max(1.0, min(10.0, accuracy))
-    clarity = max(1.0, min(10.0, clarity))
-    safety = max(1.0, min(10.0, safety))
-
-    if "composite" in data:
-        composite = float(data["composite"])
-    else:
-        composite = (
-            relevance * _WEIGHTS["relevance"]
-            + accuracy * _WEIGHTS["accuracy"]
-            + clarity * _WEIGHTS["clarity"]
-            + safety * _WEIGHTS["safety"]
-        )
+    active = [criterion for criterion in _WEIGHTS if criterion in criteria] or list(_WEIGHTS)
+    composite = sum(scores[name] * _WEIGHTS[name] for name in active) / sum(
+        _WEIGHTS[name] for name in active
+    )
+    confidence = data.get("confidence", 0.0)
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not isfinite(confidence):
+        confidence = 0.0
 
     return JudgeScore(
-        relevance=round(relevance, 2),
-        accuracy=round(accuracy, 2),
-        clarity=round(clarity, 2),
-        safety=round(safety, 2),
+        relevance=round(scores["relevance"], 2),
+        accuracy=round(scores["accuracy"], 2),
+        clarity=round(scores["clarity"], 2),
+        safety=round(scores["safety"], 2),
         composite=round(composite, 2),
         reasoning=str(data.get("reasoning", "")),
-        confidence=round(float(data.get("confidence", 0.7)), 2),
+        confidence=round(max(0.0, min(1.0, confidence)), 2),
         model=model,
         criteria_used=criteria,
     )
@@ -161,8 +160,7 @@ class LLMJudge:
         Returns:
             JudgeScore with per-criterion scores and composite.
 
-        Raises:
-            LLMProviderError: If the judge call fails after retries.
+        Invalid or unavailable scores carry an explicit error and no composite.
         """
         active_criteria = criteria or list(_WEIGHTS.keys())
         prompt = _JUDGE_USER_TEMPLATE.format(
@@ -171,6 +169,7 @@ class LLMJudge:
             criteria=", ".join(active_criteria),
         )
 
+        llm_response = None
         try:
             llm_response = await self._client.complete(
                 prompt=prompt,
@@ -181,22 +180,30 @@ class LLMJudge:
                 max_tokens=400,
                 response_format={"type": "json_object"},
             )
-            return _parse_judge_response(llm_response.content, self._model, active_criteria)
-        except json.JSONDecodeError as exc:
-            logger.warning("Judge returned invalid JSON, using defaults", error=str(exc))
-            return JudgeScore(
-                relevance=5.0,
-                accuracy=5.0,
-                clarity=5.0,
-                safety=5.0,
-                composite=5.0,
-                reasoning="Parse error — default scores assigned",
-                confidence=0.0,
-                model=self._model,
-                criteria_used=active_criteria,
-            )
-        except Exception as exc:
-            raise LLMProviderError(f"Judge scoring failed: {exc}") from exc
+            result = _parse_judge_response(llm_response.content, self._model, active_criteria)
+        except (ValueError, OverflowError) as exc:
+            logger.warning("Invalid judge response", error_type=type(exc).__name__)
+            error = "Invalid judge response"
+        except LLMClientError as exc:
+            logger.warning("Judge provider failed", error_type=type(exc).__name__)
+            error = "Judge provider unavailable"
+        else:
+            result.usage = llm_response
+            return result
+
+        return JudgeScore(
+            relevance=None,
+            accuracy=None,
+            clarity=None,
+            safety=None,
+            composite=None,
+            reasoning="",
+            confidence=0.0,
+            model=self._model,
+            criteria_used=active_criteria,
+            error=error,
+            usage=llm_response,
+        )
 
     async def score_pair(
         self,
@@ -216,8 +223,6 @@ class LLMJudge:
         Returns:
             Tuple of (score_a, score_b).
         """
-        import asyncio
-
         score_a, score_b = await asyncio.gather(
             self.score(response_a, user_input, criteria),
             self.score(response_b, user_input, criteria),

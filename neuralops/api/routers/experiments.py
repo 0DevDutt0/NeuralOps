@@ -13,6 +13,7 @@ from neuralops.schemas.experiment import (
     SignificanceResponse,
     TrialCreate,
     TrialResponse,
+    UsageSummary,
 )
 from neuralops.services import experiment_service
 
@@ -60,6 +61,14 @@ async def list_experiments(
     return await experiment_service.list_experiments(db, status=status, skip=skip, limit=limit)
 
 
+@router.get("/usage", response_model=UsageSummary, summary="Summarize recorded trial usage")
+async def get_usage(
+    experiment_id: str | None = None,
+    db: AsyncSession = Depends(get_db),
+) -> UsageSummary:
+    return await experiment_service.get_usage(db, experiment_id)
+
+
 @router.get("/{experiment_id}", response_model=ExperimentDetailResponse, summary="Get experiment")
 async def get_experiment(
     experiment_id: str,
@@ -95,7 +104,7 @@ async def run_trial(
     """Execute a single A/B trial for an experiment.
 
     Runs the input through both prompt versions concurrently, scores
-    with LLM-as-Judge, stores the result, and checks for a winner.
+    with LLM-as-Judge, and checks for a winner at the planned sample size.
 
     Args:
         experiment_id: UUID of the experiment.
@@ -121,10 +130,7 @@ async def get_significance(
     experiment_id: str,
     db: AsyncSession = Depends(get_db),
 ) -> SignificanceResponse:
-    """Run significance test on all trials for an experiment.
-
-    Uses Welch's t-test (unequal variance) to determine if the score
-    difference between versions A and B is statistically significant.
+    """Report paired statistics, with inference at the fixed endpoint.
 
     Args:
         experiment_id: UUID of the experiment.
